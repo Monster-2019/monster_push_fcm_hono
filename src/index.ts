@@ -1,4 +1,6 @@
 import { Hono } from "hono";
+import { validator } from "hono/validator";
+import { z } from "zod";
 
 type Bindings = {
   FIREBASE_ADMINSDK: string;
@@ -68,17 +70,21 @@ const fetchAccessToken = async (FIREBASE_ADMINSDK: string) => {
       .replace(/\//g, "_");
 
   // 5️⃣ 请求 Google token
-  const res = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-      assertion: signedJWT,
-    }),
-  });
+  try {
+    const res = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        assertion: signedJWT,
+      }),
+    });
 
-  const data: GoogleAuthResponse = await res.json();
-  return data.access_token;
+    const data: GoogleAuthResponse = await res.json();
+    return data.access_token;
+  } catch (e) {
+    return "";
+  }
 };
 
 const getAccessToken = async (env: Bindings) => {
@@ -99,22 +105,54 @@ app.get("/", async (c) => {
   }
 });
 
-app.post("/send", async (c) => {
-  const req = await c.req.json();
+const fcmMessageSchema = z.object({
+  message: z.object({
+    notification: z.object({
+      title: z.string(),
+      body: z.string(),
+    }),
+    webpush: z.object({
+      fcm_options: z.object({
+        link: z.string(), // 验证 link 字段是一个有效的 URL
+      }),
+      notification: z.object({
+        icon: z.string(), // 验证 icon 字段是一个有效的 URL
+      }),
+    }),
+    data: z.object({
+      messageId: z.string(),
+    }),
+  }),
+  tokens: z.array(z.string()), // tokens 是一个字符串数组
+});
 
-  const accessToken = await getAccessToken(c.env);
+app.post(
+  "/send",
+  validator("json", (value, c) => {
+    const parsed = fcmMessageSchema.safeParse(value);
+    if (!parsed.success) {
+      return c.text(parsed.error.message, 400);
+    }
+    return parsed.data;
+  }),
+  async (c) => {
+    const data = c.req.valid("json");
+    const accessToken = await getAccessToken(c.env);
+    if (!accessToken) return c.text("Invalid AccessToken");
 
-  const { tokens, message } = req;
-  if (!tokens.length) return c.json([]);
-  try {
-    const pendingList = Promise.all(
-      tokens.map(
-        async (token: string) =>
-          await fetch(SEND_URL, {
+    const { tokens, message } = data;
+    if (!tokens.length) return c.json([]);
+    try {
+      const pendingList = Promise.all(
+        tokens.map(async (token: string) => {
+          const res = await fetch(SEND_URL, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              Authorization: "Bearer " + accessToken,
+              // Authorization: "Bearer " + accessToken,
+              Authorization:
+                "Bearer " +
+                "REDACTED_GOOGLE_OAUTH_ACCESS_TOKEN",
             },
             body: JSON.stringify({
               message: {
@@ -122,14 +160,16 @@ app.post("/send", async (c) => {
                 token,
               },
             }),
-          })
-      )
-    );
-    const result = await pendingList;
-    return c.json(result);
-  } catch (e) {
-    return c.text(JSON.stringify(e));
+          });
+          return await res.json().catch((e) => JSON.stringify(e));
+        })
+      );
+      const result = await pendingList;
+      return c.json(result);
+    } catch (e) {
+      return c.text(JSON.stringify(e));
+    }
   }
-});
+);
 
 export default app;
