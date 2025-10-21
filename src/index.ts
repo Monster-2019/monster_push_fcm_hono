@@ -149,10 +149,10 @@ app.post(
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              // Authorization: "Bearer " + accessToken,
-              Authorization:
-                "Bearer " +
-                "REDACTED_GOOGLE_OAUTH_ACCESS_TOKEN",
+              Authorization: "Bearer " + accessToken,
+              // Authorization:
+              //   "Bearer " +
+              //   "REDACTED_GOOGLE_OAUTH_ACCESS_TOKEN",
             },
             body: JSON.stringify({
               message: {
