@@ -1,4 +1,4 @@
-import { Hono, type MiddlewareHandler } from "hono";
+import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { validator } from "hono/validator";
 import { z } from "zod";
 import { cors } from "hono/cors";
@@ -15,6 +15,8 @@ interface GoogleAuthResponse {
   token_type: string;
 }
 
+type AppContext = Context<{ Bindings: Bindings }>;
+
 const app = new Hono<{ Bindings: Bindings }>();
 
 const SEND_URL =
@@ -25,6 +27,12 @@ const HMAC_TOLERANCE_SECONDS = 300;
 const HEX_SIGNATURE_LENGTH = 64;
 
 const encoder = new TextEncoder();
+const sendJson = <T>(
+  c: AppContext,
+  status: number,
+  message: string,
+  data: T,
+) => c.json({ code: status, message, data }, status);
 
 const toHex = (value: ArrayBuffer) =>
   Array.from(new Uint8Array(value))
@@ -82,20 +90,20 @@ const verifyHmacSignature: MiddlewareHandler<{ Bindings: Bindings }> = async (
   next,
 ) => {
   const secret = c.env.HMAC_SECRET;
-  if (!secret) return c.text("HMAC secret is not configured", 500);
+  if (!secret) return sendJson(c, 500, "HMAC secret is not configured", null);
 
   const signatureHeader = c.req.header(HMAC_SIGNATURE_HEADER);
   const timestampHeader = c.req.header(HMAC_TIMESTAMP_HEADER);
 
   if (!signatureHeader || !timestampHeader) {
-    return c.text("Missing signature headers", 401);
+    return sendJson(c, 401, "Missing signature headers", null);
   }
 
   // 1. 严格检查时间戳
   const timestamp = Number(timestampHeader);
   const now = Math.floor(Date.now() / 1000);
   if (isNaN(timestamp) || Math.abs(now - timestamp) > HMAC_TOLERANCE_SECONDS) {
-    return c.text("Invalid or expired timestamp", 401);
+    return sendJson(c, 401, "Invalid or expired timestamp", null);
   }
 
   // 2. 使用 clone().arrayBuffer() 处理，这对处理原始数据更可靠
@@ -126,7 +134,7 @@ const verifyHmacSignature: MiddlewareHandler<{ Bindings: Bindings }> = async (
 
   // 3. 安全比较 (假设你的 timingSafeEqual 支持 hex 字符串比较)
   if (!timingSafeEqual(signatureHex, expectedHex)) {
-    return c.text("Invalid signature", 401);
+    return sendJson(c, 401, "Invalid signature", null);
   }
 
   await next();
@@ -237,21 +245,17 @@ app.post(
   verifyHmacSignature,
   validator("json", (value, c) => {
     if (!value || Object.keys(value).length === 0) {
-      return c.json({ message: "Payload is empty" }, 400);
+      return sendJson(c, 400, "Payload is empty", null);
     }
     const parsed = requestSchema.safeParse(value);
     if (!parsed.success) {
-      return c.json(
-        {
-          message: "Invalid request body",
+      return sendJson(c, 400, "Invalid request body", {
           // 这里的 path 处理会将层级连起来，如 "message.notification.title"
           issues: parsed.error.issues.map((issue) => ({
             path: issue.path.join("."),
             message: issue.message,
           })),
-        },
-        400,
-      );
+      });
     }
 
     return parsed.data;
@@ -259,10 +263,10 @@ app.post(
   async (c) => {
     const data = c.req.valid("json");
     const accessToken = await getAccessToken(c.env);
-    if (!accessToken) return c.text("Invalid AccessToken");
+    if (!accessToken) return sendJson(c, 500, "Invalid AccessToken", null);
 
     const { tokens, message } = data;
-    if (!tokens.length) return c.json([]);
+    if (!tokens.length) return sendJson(c, 200, "No tokens to send", []);
     try {
       const pendingList = Promise.all(
         tokens.map(async (token: string) => {
@@ -283,9 +287,11 @@ app.post(
         }),
       );
       const result = await pendingList;
-      return c.json(result);
+      return sendJson(c, 200, "ok", result);
     } catch (e) {
-      return c.text(JSON.stringify(e));
+      return sendJson(c, 500, "Failed to send push messages", {
+        error: e instanceof Error ? e.message : String(e),
+      });
     }
   },
 );
