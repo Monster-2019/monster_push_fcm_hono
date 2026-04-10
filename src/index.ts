@@ -1,10 +1,12 @@
-import { Hono } from "hono";
+import { Hono, type MiddlewareHandler } from "hono";
 import { validator } from "hono/validator";
 import { z } from "zod";
+import { cors } from "hono/cors";
 
 type Bindings = {
   FIREBASE_ADMINSDK: string;
   FCM: KVNamespace;
+  HMAC_SECRET: string;
 };
 
 interface GoogleAuthResponse {
@@ -17,6 +19,118 @@ const app = new Hono<{ Bindings: Bindings }>();
 
 const SEND_URL =
   "https://fcm.googleapis.com/v1/projects/monster-push/messages:send";
+const HMAC_SIGNATURE_HEADER = "x-signature";
+const HMAC_TIMESTAMP_HEADER = "x-timestamp";
+const HMAC_TOLERANCE_SECONDS = 300;
+const HEX_SIGNATURE_LENGTH = 64;
+
+const encoder = new TextEncoder();
+
+const toHex = (value: ArrayBuffer) =>
+  Array.from(new Uint8Array(value))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+
+const timingSafeEqual = (a: string, b: string) => {
+  if (a.length !== b.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return mismatch === 0;
+};
+
+const parseSignature = (signature: string) => {
+  if (/^sha256=/i.test(signature)) {
+    return signature.slice("sha256=".length).toLowerCase();
+  }
+  return signature.toLowerCase();
+};
+
+const requestSchema = z.object({
+  message: z.object({
+    notification: z.object({
+      title: z.string().min(1, "标题不能为空"),
+      body: z.string().min(1, "内容不能为空"),
+    }),
+
+    webpush: z
+      .object({
+        fcm_options: z
+          .object({
+            link: z.string().url("链接格式不正确").optional(),
+          })
+          .optional(),
+        notification: z
+          .object({
+            icon: z.string().url("图标链接格式不正确").optional(),
+          })
+          .optional(),
+      })
+      .optional(),
+
+    data: z.record(z.string(), z.string()).optional(),
+  }),
+
+  tokens: z
+    .array(z.string().min(1, "Token 不能为空"))
+    .min(1, "至少需要提供一个 Token"),
+});
+
+const verifyHmacSignature: MiddlewareHandler<{ Bindings: Bindings }> = async (
+  c,
+  next,
+) => {
+  const secret = c.env.HMAC_SECRET;
+  if (!secret) return c.text("HMAC secret is not configured", 500);
+
+  const signatureHeader = c.req.header(HMAC_SIGNATURE_HEADER);
+  const timestampHeader = c.req.header(HMAC_TIMESTAMP_HEADER);
+
+  if (!signatureHeader || !timestampHeader) {
+    return c.text("Missing signature headers", 401);
+  }
+
+  // 1. 严格检查时间戳
+  const timestamp = Number(timestampHeader);
+  const now = Math.floor(Date.now() / 1000);
+  if (isNaN(timestamp) || Math.abs(now - timestamp) > HMAC_TOLERANCE_SECONDS) {
+    return c.text("Invalid or expired timestamp", 401);
+  }
+
+  // 2. 使用 clone().arrayBuffer() 处理，这对处理原始数据更可靠
+  // 避免 text() 可能产生的编码/换行符问题
+  const bodyBuffer = await c.req.raw.clone().arrayBuffer();
+  const rawBody = new TextDecoder().decode(bodyBuffer);
+
+  // 如果你发现后面的 validator 拿到的 value 是 {}
+  // 可以在这里强制把解析好的 body 挂载一下，或者确保流没死
+
+  const payload = `${timestampHeader}.${rawBody}`;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+
+  const expectedBuffer = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    encoder.encode(payload),
+  );
+
+  const expectedHex = toHex(expectedBuffer);
+  const signatureHex = parseSignature(signatureHeader);
+
+  // 3. 安全比较 (假设你的 timingSafeEqual 支持 hex 字符串比较)
+  if (!timingSafeEqual(signatureHex, expectedHex)) {
+    return c.text("Invalid signature", 401);
+  }
+
+  await next();
+};
 
 const fetchAccessToken = async (FIREBASE_ADMINSDK: string) => {
   const sa = JSON.parse(FIREBASE_ADMINSDK);
@@ -52,13 +166,13 @@ const fetchAccessToken = async (FIREBASE_ADMINSDK: string) => {
     keyData,
     { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
     false,
-    ["sign"]
+    ["sign"],
   );
 
   const signature = await crypto.subtle.sign(
     "RSASSA-PKCS1-v1_5",
     privateKey,
-    new TextEncoder().encode(unsignedJWT)
+    new TextEncoder().encode(unsignedJWT),
   );
 
   const signedJWT =
@@ -96,43 +210,50 @@ const getAccessToken = async (env: Bindings) => {
   return accessToken;
 };
 
-app.get("/", async (c) => {
-  try {
-    const data = await getAccessToken(c.env);
-    return c.text(data);
-  } catch (e) {
-    return c.text(String(e));
-  }
-});
+// app.get("/", async (c) => {
+//   try {
+//     const data = await getAccessToken(c.env);
+//     return c.text(data);
+//   } catch (e) {
+//     return c.text(String(e));
+//   }
+// });
 
-const fcmMessageSchema = z.object({
-  message: z.object({
-    notification: z.object({
-      title: z.string(),
-      body: z.string(),
-    }),
-    webpush: z.object({
-      fcm_options: z.object({
-        link: z.string(), // 验证 link 字段是一个有效的 URL
-      }),
-      notification: z.object({
-        icon: z.string(), // 验证 icon 字段是一个有效的 URL
-      }),
-    }),
-    data: z.object({
-      messageId: z.string(),
-    }),
+app.use(
+  "/*",
+  cors({
+    origin: "*",
+    allowMethods: ["POST", "OPTIONS"],
+    allowHeaders: [
+      "Content-Type",
+      HMAC_SIGNATURE_HEADER,
+      HMAC_TIMESTAMP_HEADER,
+    ],
   }),
-  tokens: z.array(z.string()), // tokens 是一个字符串数组
-});
+);
 
 app.post(
   "/send",
+  verifyHmacSignature,
   validator("json", (value, c) => {
-    const parsed = fcmMessageSchema.safeParse(value);
-    if (!parsed.success) {
-      return c.text(parsed.error.message, 400);
+    if (!value || Object.keys(value).length === 0) {
+      return c.json({ message: "Payload is empty" }, 400);
     }
+    const parsed = requestSchema.safeParse(value);
+    if (!parsed.success) {
+      return c.json(
+        {
+          message: "Invalid request body",
+          // 这里的 path 处理会将层级连起来，如 "message.notification.title"
+          issues: parsed.error.issues.map((issue) => ({
+            path: issue.path.join("."),
+            message: issue.message,
+          })),
+        },
+        400,
+      );
+    }
+
     return parsed.data;
   }),
   async (c) => {
@@ -159,14 +280,14 @@ app.post(
             }),
           });
           return await res.json().catch((e) => JSON.stringify(e));
-        })
+        }),
       );
       const result = await pendingList;
       return c.json(result);
     } catch (e) {
       return c.text(JSON.stringify(e));
     }
-  }
+  },
 );
 
 export default app;
