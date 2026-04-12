@@ -5,14 +5,9 @@
     "moduleResolution": "Bundler",
     "strict": true,
     "skipLibCheck": true,
-    "lib": [
-      "ESNext",
-      "WebWorker"
-    ],
+    "lib": ["ESNext", "WebWorker"],
     "jsx": "react-jsx",
     "jsxImportSource": "hono/jsx",
-    "types": [
-      "@cloudflare/workers-types"
-    ]
-  },
+    "types": ["@cloudflare/workers-types", "./src/types.d.ts"]
+  }
 }

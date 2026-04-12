@@ -18,7 +18,7 @@ export const sendJson = <T>(
   status: number,
   message: string,
   data: T,
-) => c.json({ code: status, message, data }, status);
+) => c.json({ code: status, message, data }, status as never);
 
 export const toHex = (value: ArrayBuffer) =>
   Array.from(new Uint8Array(value))

@@ -1,7 +1,7 @@
 import { Hono, type MiddlewareHandler } from "hono";
 import { cors } from "hono/cors";
-import { validator } from "hono/validator";
 import { z } from "zod";
+import { serve } from "@upstash/workflow/hono";
 import {
   getAccessToken,
   parseSignature,
@@ -9,12 +9,7 @@ import {
   timingSafeEqual,
   toHex,
 } from "./lib";
-
-type Bindings = {
-  FIREBASE_ADMINSDK: string;
-  FCM: KVNamespace;
-  HMAC_SECRET: string;
-};
+import { getFetchOptions } from "./lib/fetch";
 
 const app = new Hono<{ Bindings: Bindings }>();
 
@@ -30,10 +25,9 @@ const encoder = new TextEncoder();
 const requestSchema = z.object({
   message: z.object({
     notification: z.object({
-      title: z.string().min(1, "标题不能为空"),
-      body: z.string().min(1, "内容不能为空"),
+      title: z.string().min(1, "Title is required"),
+      body: z.string().min(1, "Body is required"),
     }),
-
     webpush: z
       .object({
         fcm_options: z
@@ -48,14 +42,15 @@ const requestSchema = z.object({
           .optional(),
       })
       .optional(),
-
     data: z.record(z.string(), z.string()).optional(),
   }),
-
   tokens: z
-    .array(z.string().min(1, "Token 不能为空"))
-    .min(1, "至少需要提供一个 Token"),
+    .array(z.string().min(1, "Token is required"))
+    .min(1, "At least one token is required"),
+  scheduled_at: z.string().optional(),
 });
+
+type SendRequestPayload = z.infer<typeof requestSchema>;
 
 const verifyHmacSignature: MiddlewareHandler<{ Bindings: Bindings }> = async (
   c,
@@ -95,6 +90,13 @@ const verifyHmacSignature: MiddlewareHandler<{ Bindings: Bindings }> = async (
 
   const expectedHex = toHex(expectedBuffer);
   const signatureHex = parseSignature(signatureHeader);
+  if (
+    signatureHex.length !== HEX_SIGNATURE_LENGTH ||
+    !/^[0-9a-f]+$/i.test(signatureHex)
+  ) {
+    return sendJson(c, 401, "Invalid signature format", null);
+  }
+
   if (!timingSafeEqual(signatureHex, expectedHex)) {
     return sendJson(c, 401, "Invalid signature", null);
   }
@@ -102,14 +104,74 @@ const verifyHmacSignature: MiddlewareHandler<{ Bindings: Bindings }> = async (
   await next();
 };
 
-// app.get("/", async (c) => {
-//   try {
-//     const data = await getAccessToken(c.env);
-//     return c.text(data);
-//   } catch (e) {
-//     return c.text(String(e));
-//   }
-// });
+const validateSendPayload: MiddlewareHandler<{ Bindings: Bindings }> = async (
+  c,
+  next,
+) => {
+  let payload: unknown;
+
+  try {
+    payload = await c.req.raw.clone().json();
+  } catch (_error) {
+    return sendJson(c, 400, "Invalid request body", {
+      issues: [
+        {
+          path: "",
+          message: "Request body must be valid JSON",
+        },
+      ],
+    });
+  }
+
+  if (
+    !payload ||
+    typeof payload !== "object" ||
+    Array.isArray(payload) ||
+    Object.keys(payload).length === 0
+  ) {
+    return sendJson(c, 400, "Payload is empty", null);
+  }
+
+  const parsed = requestSchema.safeParse(payload);
+  if (!parsed.success) {
+    return sendJson(c, 400, "Invalid request body", {
+      issues: parsed.error.issues.map((issue) => ({
+        path: issue.path.join("."),
+        message: issue.message,
+      })),
+    });
+  }
+
+  await next();
+};
+
+const sendPushMessages = async (payload: SendRequestPayload, env: Bindings) => {
+  const { tokens, message } = payload;
+  if (!tokens.length) return [];
+
+  const accessToken = await getAccessToken(env);
+  if (!accessToken) throw new Error("Invalid AccessToken");
+
+  return await Promise.all(
+    tokens.map(async (token) => {
+      const response = await fetch(
+        SEND_URL,
+        getFetchOptions({ ...message, token }, accessToken),
+      );
+
+      const body = await response
+        .json()
+        .catch(async () => ({ raw: await response.text().catch(() => "") }));
+
+      return {
+        token,
+        status: response.status,
+        ok: response.ok,
+        body,
+      };
+    }),
+  );
+};
 
 app.use(
   "/*",
@@ -124,59 +186,22 @@ app.use(
   }),
 );
 
-app.post(
-  "/send",
-  verifyHmacSignature,
-  validator("json", (value, c) => {
-    if (!value || Object.keys(value).length === 0) {
-      return sendJson(c, 400, "Payload is empty", null);
-    }
-    const parsed = requestSchema.safeParse(value);
-    if (!parsed.success) {
-      return sendJson(c, 400, "Invalid request body", {
-        issues: parsed.error.issues.map((issue) => ({
-          path: issue.path.join("."),
-          message: issue.message,
-        })),
-      });
-    }
+const pushWorkflow = serve<SendRequestPayload, Bindings>(async (context) => {
+  const payload = context.requestPayload;
+  const { scheduled_at } = payload;
+  const runtimeEnv = context.env as unknown as Bindings;
 
-    return parsed.data;
-  }),
-  async (c) => {
-    const data = c.req.valid("json");
-    const accessToken = await getAccessToken(c.env);
-    if (!accessToken) return sendJson(c, 500, "Invalid AccessToken", null);
+  if (scheduled_at) {
+    await context.sleepUntil("wait-for-push", scheduled_at);
+  }
 
-    const { tokens, message } = data;
-    if (!tokens.length) return sendJson(c, 200, "No tokens to send", []);
-    try {
-      const pendingList = Promise.all(
-        tokens.map(async (token: string) => {
-          const res = await fetch(SEND_URL, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: "Bearer " + accessToken,
-            },
-            body: JSON.stringify({
-              message: {
-                ...message,
-                token,
-              },
-            }),
-          });
-          return await res.json().catch((e) => JSON.stringify(e));
-        }),
-      );
-      const result = await pendingList;
-      return sendJson(c, 200, "ok", result);
-    } catch (e) {
-      return sendJson(c, 500, "Failed to send push messages", {
-        error: e instanceof Error ? e.message : String(e),
-      });
-    }
-  },
-);
+  const result = await context.run("execute-push", async () => {
+    return await sendPushMessages(payload, runtimeEnv);
+  });
+
+  return { code: 200, message: "ok", data: result };
+});
+
+app.post("/send", verifyHmacSignature, validateSendPayload, pushWorkflow);
 
 export default app;
