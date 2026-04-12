@@ -61,6 +61,7 @@ const verifyHmacSignature: MiddlewareHandler<{ Bindings: Bindings }> = async (
 
   const signatureHeader = c.req.header(HMAC_SIGNATURE_HEADER);
   const timestampHeader = c.req.header(HMAC_TIMESTAMP_HEADER);
+
   if (!signatureHeader || !timestampHeader) {
     return sendJson(c, 401, "Missing signature headers", null);
   }
@@ -145,7 +146,12 @@ const validateSendPayload: MiddlewareHandler<{ Bindings: Bindings }> = async (
   await next();
 };
 
-const sendPushMessages = async (payload: SendRequestPayload, env: Bindings) => {
+const sendPushMessages = async (
+  payload: SendRequestPayload,
+  headers: Record<string, string | null>,
+  env: Bindings,
+) => {
+  console.log("send");
   const { tokens, message } = payload;
   if (!tokens.length) return [];
 
@@ -156,7 +162,7 @@ const sendPushMessages = async (payload: SendRequestPayload, env: Bindings) => {
     tokens.map(async (token) => {
       const response = await fetch(
         SEND_URL,
-        getFetchOptions({ ...message, token }, accessToken),
+        getFetchOptions({ ...message, token }, headers, accessToken),
       );
 
       const body = await response
@@ -186,22 +192,51 @@ app.use(
   }),
 );
 
-const pushWorkflow = serve<SendRequestPayload, Bindings>(async (context) => {
-  const payload = context.requestPayload;
-  const { scheduled_at } = payload;
-  const runtimeEnv = context.env as unknown as Bindings;
+const pushWorkflow = serve<SendRequestPayload, Bindings>(
+  async (context) => {
+    const payload = context.requestPayload;
 
-  if (scheduled_at) {
-    await context.sleepUntil("wait-for-push", scheduled_at);
-  }
+    const headers = {
+      "x-signature": context.headers.get("x-signature") ?? "",
+      "x-timestamp": context.headers.get("x-timestamp") ?? "",
+    };
 
-  const result = await context.run("execute-push", async () => {
-    return await sendPushMessages(payload, runtimeEnv);
+    const { scheduled_at } = payload;
+
+    if (scheduled_at) {
+      console.log(scheduled_at);
+      await context.sleepUntil("wait-for-push", scheduled_at);
+    }
+
+    await context.run("execute-push", async () => {
+      return await sendPushMessages(
+        payload,
+        headers,
+        context.env as unknown as Bindings,
+      );
+    });
+  },
+  {
+    retries: 0,
+  },
+);
+
+app.post("/send", verifyHmacSignature, validateSendPayload, async (c) => {
+  const payload = await c.req.json();
+
+  await fetch(`${new URL(c.req.url).origin}/workflow/send`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-signature": c.req.header("x-signature") ?? "",
+      "x-timestamp": c.req.header("x-timestamp") ?? "",
+    },
+    body: JSON.stringify(payload),
   });
 
-  return { code: 200, message: "ok", data: result };
+  return c.json({ ok: true });
 });
 
-app.post("/send", verifyHmacSignature, validateSendPayload, pushWorkflow);
+app.post("/workflow/send", pushWorkflow);
 
 export default app;
