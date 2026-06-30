@@ -1,7 +1,7 @@
 import { Hono, type MiddlewareHandler } from "hono";
 import { cors } from "hono/cors";
 import { z } from "zod";
-import { serve } from "@upstash/workflow/hono";
+import { Client } from "@upstash/qstash"; // 确认为纯 qstash 库
 import { getAccessToken, sendJson, timingSafeEqual, toHex } from "./lib";
 import { getFetchOptions } from "./lib/fetch";
 
@@ -22,6 +22,14 @@ const HMAC_TOLERANCE_SECONDS = 300;
 const HEX_SIGNATURE_LENGTH = 64;
 
 const encoder = new TextEncoder();
+
+let qstashClientInstance: Client | null = null;
+function getQStashClient(token: string) {
+  if (!qstashClientInstance) {
+    qstashClientInstance = new Client({ token });
+  }
+  return qstashClientInstance;
+}
 
 const requestSchema = z.object({
   message: z.object({
@@ -178,45 +186,80 @@ app.use(
   }),
 );
 
-const pushWorkflow = serve<SendRequestPayload, Bindings>(async (context) => {
-  const payload = context.requestPayload;
+app.post("/send", verifyHmacSignature, validateSendPayload, async (c) => {
+  const payload = c.get("validatedPayload");
   const { scheduledAt } = payload;
 
   const headers = {
-    "x-signature": context.headers.get("x-signature") ?? "",
-    "x-timestamp": context.headers.get("x-timestamp") ?? "",
+    "x-signature": c.req.header("x-signature") ?? "",
+    "x-timestamp": c.req.header("x-timestamp") ?? "",
   };
 
-  if (scheduledAt) {
-    console.log(scheduledAt);
-    await context.sleepUntil("wait-for-push", scheduledAt);
+  // 场景 A：无定时，立即发送（最快路径，直接打给 FCM，不和 Upstash 产生任何交互）
+  if (!scheduledAt) {
+    try {
+      const results = await sendPushMessages(payload, headers, c.env);
+      return c.json({ ok: true, source: "immediate", results });
+    } catch (error) {
+      console.error("Immediate push failed:", error);
+      return sendJson(c, 500, "Immediate push failed", {
+        error: String(error),
+      });
+    }
   }
 
-  await context.run("execute-push", async () => {
-    return await sendPushMessages(
-      payload,
-      headers,
-      context.env as unknown as Bindings,
-    );
-  });
+  // 场景 B：包含定时，将其安全投递至 QStash 延时队列
+  try {
+    const qstash = getQStashClient(c.env.QSTASH_TOKEN);
+
+    // const currentOrigin = new URL(c.req.url).origin;
+    const currentOrigin = "https://fcm-api.dxin.cc/send";
+
+    const result = await qstash.publishJSON({
+      url: `${currentOrigin}/execute-send`,
+      body: payload,
+      at: Math.floor(new Date(scheduledAt).getTime() / 1000),
+      headers: {
+        "x-custom-secret": c.env.HMAC_SECRET,
+      },
+    });
+
+    console.log(`Task scheduled successfully. MessageID: ${result.messageId}`);
+    return c.json({
+      ok: true,
+      source: "scheduled",
+      messageId: result.messageId,
+    });
+  } catch (error) {
+    console.error("Failed to schedule task with QStash:", error);
+    return sendJson(c, 500, "Failed to schedule task", {
+      error: String(error),
+    });
+  }
 });
 
-app.post("/send", verifyHmacSignature, validateSendPayload, async (c) => {
-  const payload = c.get("validatedPayload");
+app.post("/execute-send", async (c) => {
+  const secret = c.req.header("x-custom-secret");
+  if (!secret || secret !== c.env.HMAC_SECRET) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
 
-  await fetch(`${new URL(c.req.url).origin}/workflow/send`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-signature": c.req.header("x-signature") ?? "",
-      "x-timestamp": c.req.header("x-timestamp") ?? "",
-    },
-    body: JSON.stringify(payload),
-  });
+  const payload = (await c.req.json()) as SendRequestPayload;
 
-  return c.json({ ok: true });
+  const headers = {
+    "x-signature": c.req.header("x-signature") ?? "",
+    "x-timestamp": c.req.header("x-timestamp") ?? "",
+  };
+
+  try {
+    console.log("QStash alarm triggered, executing push task...");
+    const results = await sendPushMessages(payload, headers, c.env);
+    return c.json({ ok: true, results });
+  } catch (error) {
+    console.error("FCM dispatch failed during scheduled execution:", error);
+    // 返回 500 状态码极其关键！QStash 收到 500 后会将其识别为失败，并自动触发内置的指数退避重试（Retry）
+    return c.json({ error: String(error) }, 500);
+  }
 });
-
-app.post("/workflow/send", pushWorkflow);
 
 export default app;
