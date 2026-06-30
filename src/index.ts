@@ -213,15 +213,20 @@ app.post("/send", verifyHmacSignature, validateSendPayload, async (c) => {
     const qstash = getQStashClient(c.env.QSTASH_TOKEN);
 
     // const currentOrigin = new URL(c.req.url).origin;
-    const currentOrigin = "https://fcm-api.dxin.cc/send";
+    const currentOrigin = "https://fcm-api.dxin.cc";
+    // const currentOrigin =
+    //   "https://onto-install-compilation-argued.trycloudflare.com";
 
-    const result = await qstash.publishJSON({
+    const targetTime = Math.floor(new Date(scheduledAt).getTime() / 1000);
+
+    const result = await qstash.publish({
       url: `${currentOrigin}/execute-send`,
-      body: payload,
-      at: Math.floor(new Date(scheduledAt).getTime() / 1000),
+      body: JSON.stringify(payload),
       headers: {
+        "content-type": "application/json",
         "x-custom-secret": c.env.HMAC_SECRET,
       },
+      notBefore: targetTime, // ✅ 注意：毫秒时间戳
     });
 
     console.log(`Task scheduled successfully. MessageID: ${result.messageId}`);
