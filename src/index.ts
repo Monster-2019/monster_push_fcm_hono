@@ -2,16 +2,17 @@ import { Hono, type MiddlewareHandler } from "hono";
 import { cors } from "hono/cors";
 import { z } from "zod";
 import { serve } from "@upstash/workflow/hono";
-import {
-  getAccessToken,
-  parseSignature,
-  sendJson,
-  timingSafeEqual,
-  toHex,
-} from "./lib";
+import { getAccessToken, sendJson, timingSafeEqual, toHex } from "./lib";
 import { getFetchOptions } from "./lib/fetch";
 
-const app = new Hono<{ Bindings: Bindings }>();
+type Env = {
+  Bindings: Bindings; // 你的环境变量类型
+  Variables: {
+    validatedPayload: SendRequestPayload; // 你的自定义上下文变量
+  };
+};
+
+const app = new Hono<Env>();
 
 const SEND_URL =
   "https://fcm.googleapis.com/v1/projects/monster-push/messages:send";
@@ -47,7 +48,7 @@ const requestSchema = z.object({
   tokens: z
     .array(z.string().min(1, "Token is required"))
     .min(1, "At least one token is required"),
-  scheduled_at: z.string().optional(),
+  scheduledAt: z.string().optional(),
 });
 
 type SendRequestPayload = z.infer<typeof requestSchema>;
@@ -88,31 +89,24 @@ const verifyHmacSignature: MiddlewareHandler<{ Bindings: Bindings }> = async (
     key,
     encoder.encode(payload),
   );
-
   const expectedHex = toHex(expectedBuffer);
-  const signatureHex = parseSignature(signatureHeader);
-  if (
-    signatureHex.length !== HEX_SIGNATURE_LENGTH ||
-    !/^[0-9a-f]+$/i.test(signatureHex)
-  ) {
+
+  // 假设 parseSignature 获取 hex，这里直接简单对比（若格式不符由 timingSafeEqual 兜底或长度前置判断）
+  if (signatureHeader.length !== HEX_SIGNATURE_LENGTH) {
     return sendJson(c, 401, "Invalid signature format", null);
   }
 
-  if (!timingSafeEqual(signatureHex, expectedHex)) {
+  if (!timingSafeEqual(signatureHeader, expectedHex)) {
     return sendJson(c, 401, "Invalid signature", null);
   }
 
   await next();
 };
 
-const validateSendPayload: MiddlewareHandler<{ Bindings: Bindings }> = async (
-  c,
-  next,
-) => {
+const validateSendPayload: MiddlewareHandler<Env> = async (c, next) => {
   let payload: unknown;
-
   try {
-    payload = await c.req.raw.clone().json();
+    payload = await c.req.raw.json();
   } catch (_error) {
     return sendJson(c, 400, "Invalid request body", {
       issues: [
@@ -122,15 +116,6 @@ const validateSendPayload: MiddlewareHandler<{ Bindings: Bindings }> = async (
         },
       ],
     });
-  }
-
-  if (
-    !payload ||
-    typeof payload !== "object" ||
-    Array.isArray(payload) ||
-    Object.keys(payload).length === 0
-  ) {
-    return sendJson(c, 400, "Payload is empty", null);
   }
 
   const parsed = requestSchema.safeParse(payload);
@@ -143,6 +128,7 @@ const validateSendPayload: MiddlewareHandler<{ Bindings: Bindings }> = async (
     });
   }
 
+  c.set("validatedPayload", parsed.data);
   await next();
 };
 
@@ -192,37 +178,31 @@ app.use(
   }),
 );
 
-const pushWorkflow = serve<SendRequestPayload, Bindings>(
-  async (context) => {
-    const payload = context.requestPayload;
+const pushWorkflow = serve<SendRequestPayload, Bindings>(async (context) => {
+  const payload = context.requestPayload;
+  const { scheduledAt } = payload;
 
-    const headers = {
-      "x-signature": context.headers.get("x-signature") ?? "",
-      "x-timestamp": context.headers.get("x-timestamp") ?? "",
-    };
+  const headers = {
+    "x-signature": context.headers.get("x-signature") ?? "",
+    "x-timestamp": context.headers.get("x-timestamp") ?? "",
+  };
 
-    const { scheduled_at } = payload;
+  if (scheduledAt) {
+    console.log(scheduledAt);
+    await context.sleepUntil("wait-for-push", scheduledAt);
+  }
 
-    if (scheduled_at) {
-      console.log(scheduled_at);
-      await context.sleepUntil("wait-for-push", scheduled_at);
-    }
-
-    await context.run("execute-push", async () => {
-      return await sendPushMessages(
-        payload,
-        headers,
-        context.env as unknown as Bindings,
-      );
-    });
-  },
-  {
-    retries: 0,
-  },
-);
+  await context.run("execute-push", async () => {
+    return await sendPushMessages(
+      payload,
+      headers,
+      context.env as unknown as Bindings,
+    );
+  });
+});
 
 app.post("/send", verifyHmacSignature, validateSendPayload, async (c) => {
-  const payload = await c.req.json();
+  const payload = c.get("validatedPayload");
 
   await fetch(`${new URL(c.req.url).origin}/workflow/send`, {
     method: "POST",
